@@ -9,7 +9,7 @@ import pyrogram
 from database.connections_mdb import active_connection, all_connections, delete_connection, if_active, make_active, \
     make_inactive
 from info import ADMINS, AUTH_CHANNEL, AUTH_USERS, CUSTOM_FILE_CAPTION, AUTH_GROUPS, P_TTI_SHOW_OFF, IMDB, \
-    SINGLE_BUTTON, SPELL_CHECK_REPLY, IMDB_TEMPLATE
+    SINGLE_BUTTON, SPELL_CHECK_REPLY, IMDB_TEMPLATE, VPLINK_API_KEY
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait, UserIsBlocked, MessageNotModified, PeerIdInvalid
@@ -22,12 +22,15 @@ from database.filters_mdb import (
     get_filters,
 )
 import logging
+import aiohttp
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.ERROR)
 
 BUTTONS = {}
 SPELL_CHECK = {}
+SEARCH_CACHE = {}  # search_key -> {query, user_id, protect}
 
 
 @Client.on_message(filters.group | filters.private & filters.text & filters.incoming) #GIVE FILTER IN PM BRO IDEA OF GOUTHAM SER
@@ -60,6 +63,11 @@ async def next_page(bot, query):
     if not files:
         return
     settings = await get_settings(query.message.chat.id)
+    SEARCH_CACHE[key] = {
+        "query": search,
+        "user_id": int(req),
+        "protect": bool(settings.get("file_secure", False)),
+    }
     if settings['button']:
         btn = [
             [
@@ -83,6 +91,7 @@ async def next_page(bot, query):
             for file in files
         ]
 
+    btn.append([InlineKeyboardButton("📦 SEND ALL", callback_data=f"sendall#{key}")])
     if 0 < offset <= 10:
         off_set = 0
     elif offset == 0:
@@ -138,6 +147,39 @@ async def advantage_spoll_choker(bot, query):
             k = await query.message.edit(script.MOV_NT_FND)#script change
             await asyncio.sleep(10)
             await k.delete()
+
+
+async def create_vplink(url):
+    """Create a VPLINK short URL. Returns None when the API fails."""
+    if not VPLINK_API_KEY:
+        return None
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                "https://vplink.in/api",
+                params={"api": VPLINK_API_KEY, "url": url, "format": "json"},
+            ) as response:
+                body = (await response.text()).strip()
+                if response.status != 200 or not body:
+                    logger.warning("VPLINK API returned HTTP %s", response.status)
+                    return None
+                try:
+                    data = await response.json(content_type=None)
+                    if data.get("status") != "success":
+                        logger.warning("VPLINK API error: %s", data.get("message", "unknown error"))
+                        return None
+                    short_url = str(data.get("shortenedUrl", "")).strip().strip('"')
+                except Exception:
+                    # Some API configurations may return plain text instead of JSON.
+                    short_url = body.strip().strip('"')
+                parsed = urlparse(short_url)
+                if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                    return None
+                return short_url
+    except Exception as exc:
+        logger.warning("VPLINK request failed: %s", exc)
+        return None
 
 
 @Client.on_callback_query()
@@ -329,6 +371,66 @@ async def cb_handler(client: Client, query: CallbackQuery):
             alert = alerts[int(i)]
             alert = alert.replace("\\n", "\n").replace("\\t", "\t")
             await query.answer(alert, show_alert=True)
+    if query.data.startswith("sendall#"):
+        search_key = query.data.split("#", 1)[1]
+        cached = SEARCH_CACHE.get(search_key)
+        if not cached:
+            return await query.answer("This search has expired. Please search again.", show_alert=True)
+        if cached["user_id"] not in (0, query.from_user.id):
+            return await query.answer("Please run your own search first.", show_alert=True)
+        await query.answer("Sending all matching files. Please wait…")
+        sent = 0
+        offset = 0
+        total = 0
+        try:
+            while True:
+                batch, next_offset, total = await get_search_results(
+                    cached["query"], offset=offset, max_results=10, filter=True
+                )
+                if not batch:
+                    break
+                for item in batch:
+                    caption = item.caption or item.file_name
+                    if CUSTOM_FILE_CAPTION:
+                        try:
+                            caption = CUSTOM_FILE_CAPTION.format(
+                                file_name=item.file_name or "",
+                                file_size=get_size(item.file_size) or "",
+                                file_caption=item.caption or "",
+                            )
+                        except Exception:
+                            logger.exception("Custom caption formatting failed")
+                    try:
+                        await client.send_cached_media(
+                            chat_id=query.from_user.id,
+                            file_id=item.file_id,
+                            caption=caption,
+                            protect_content=cached["protect"],
+                        )
+                        sent += 1
+                    except FloodWait as exc:
+                        await asyncio.sleep(exc.x)
+                        await client.send_cached_media(
+                            chat_id=query.from_user.id,
+                            file_id=item.file_id,
+                            caption=caption,
+                            protect_content=cached["protect"],
+                        )
+                        sent += 1
+                    except Exception as exc:
+                        logger.warning("Send All skipped one file: %s", exc)
+                    await asyncio.sleep(0.25)
+                if not next_offset:
+                    break
+                offset = int(next_offset)
+            await client.send_message(
+                query.from_user.id,
+                f"✅ Send All finished. Sent {sent} of {total} matching files."
+            )
+        except Exception as exc:
+            logger.exception("Send All failed")
+            await client.send_message(query.from_user.id, f"Send All stopped after {sent} files. Please try again later.")
+        return
     if query.data.startswith("file"):
         ident, file_id = query.data.split("#")
         files_ = await get_file_details(file_id)
@@ -349,6 +451,13 @@ async def cb_handler(client: Client, query: CallbackQuery):
             f_caption = f_caption
         if f_caption is None:
             f_caption = f"{files.file_name}"
+
+        if VPLINK_API_KEY:
+            destination = f"https://t.me/{temp.U_NAME}?start={ident}_{file_id}"
+            short_url = await create_vplink(destination)
+            if short_url:
+                return await query.answer(url=short_url)
+            return await query.answer("Short link could not be created. Please try again later.", show_alert=True)
 
         try:
             if AUTH_CHANNEL and not await is_subscribed(client, query):
@@ -658,6 +767,13 @@ async def auto_filter(client, msg, spoll=False):
         message = msg.message.reply_to_message  # msg will be callback query
         search, files, offset, total_results = spoll
     pre = 'filep' if settings['file_secure'] else 'file'
+    key = f"{message.chat.id}-{message.id}"
+    req = message.from_user.id if message.from_user else 0
+    SEARCH_CACHE[key] = {
+        "query": search,
+        "user_id": req,
+        "protect": bool(settings.get("file_secure", False)),
+    }
     if settings["button"]:
         btn = [
             [
@@ -682,10 +798,9 @@ async def auto_filter(client, msg, spoll=False):
             for file in files
         ]
 
+    btn.append([InlineKeyboardButton("📦 SEND ALL", callback_data=f"sendall#{key}")])
     if offset != "":
-        key = f"{message.chat.id}-{message.id}"
         BUTTONS[key] = search
-        req = message.from_user.id if message.from_user else 0
         btn.append(
             [InlineKeyboardButton(text=f"📃 1/{math.ceil(int(total_results) / 10)}", callback_data="pages"),
              InlineKeyboardButton(text="NEXT ▶️", callback_data=f"next_{req}_{key}_{offset}")]
