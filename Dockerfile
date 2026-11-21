@@ -1,5 +1,4 @@
-FROM python:3.11-slim-bookworm
-
+FROM python:3.10-slim-bookworm
 RUN apt update && apt upgrade -y
 RUN apt install git -y
 COPY requirements.txt /requirements.txt
