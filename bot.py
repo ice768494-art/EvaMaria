@@ -1,6 +1,22 @@
 import logging
 import logging.config
 
+import os
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+    def log_message(self, *args):
+        pass
+
+def run_web():
+    HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 8080))), Health).serve_forever()
+
+Thread(target=run_web, daemon=True).start()
 # Get logging configurations
 logging.config.fileConfig('logging.conf')
 logging.getLogger().setLevel(logging.INFO)
